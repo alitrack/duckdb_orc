@@ -1,5 +1,5 @@
 #
-# This workflow calls the main distribution pipeline from DuckDB to build, test and (optionally) release the extension
+# Community extension distribution pipeline (multi-platform release builds)
 #
 name: Main Extension Distribution Pipeline
 on:
@@ -19,6 +19,6 @@ jobs:
     with:
       duckdb_version: v1.5.4
       ci_tools_version: v1.5-variegata
-      extension_name: rusty_quack
+      extension_name: orc
       extra_toolchains: rust;python3
-      exclude_archs: 'linux_amd64_musl'
+      exclude_archs: 'linux_amd64_musl;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'

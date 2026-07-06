@@ -10,7 +10,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  # Fast linux build + smoke test (PR gate)
+  quick-check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,17 +28,63 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
 
-      - name: Build
+      - name: Build (debug)
+        run: cargo build
+
+  # Multi-platform release builds
+  build:
+    needs: quick-check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux_amd64
+            os: ubuntu-latest
+            lib: target/release/libduckdb_orc.so
+          - target: linux_arm64
+            os: ubuntu-24.04-arm
+            lib: target/release/libduckdb_orc.so
+          - target: osx_arm64
+            os: macos-latest
+            lib: target/release/libduckdb_orc.dylib
+          - target: osx_amd64
+            os: macos-13
+            lib: target/release/libduckdb_orc.dylib
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build (release)
         run: cargo build --release
 
-      - name: Strip
-        run: strip target/release/libduckdb_orc.so
+      - name: Strip binary
+        run: strip ${{ matrix.lib }}
 
-      - name: Create extension
-        run: make release
+      - name: Inject metadata
+        run: |
+          mkdir -p build/extension
+          python3 scripts/metadata.py ${{ matrix.lib }} \
+            -o build/extension/orc.duckdb_extension \
+            --platform ${{ matrix.target }} \
+            --duckdb-version v1.5.4 \
+            --extension-version 0.1.0
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: orc-duckdb-extension-linux-amd64
-          path: build/release/extension/orc/orc.duckdb_extension
+          name: orc-${{ matrix.target }}
+          path: build/extension/orc.duckdb_extension
