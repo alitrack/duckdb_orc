@@ -13,15 +13,21 @@ use std::{
     error::Error,
     fs::File,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
 
-/// Per-scan state: tracks whether we've produced output.
+use orc_rust::ArrowReader;
+
+/// DuckDB's STANDARD_VECTOR_SIZE — batches must not exceed this.
+const BATCH_SIZE: usize = 2048;
+
+/// Per-scan state: tracks whether the scan is done and holds the active reader.
 #[repr(C)]
 struct OrcInitData {
     done: AtomicBool,
+    reader: Mutex<Option<ArrowReader<File>>>,
 }
 
 /// Bound parameters from the `read_orc(file_path)` call.
@@ -52,6 +58,7 @@ impl VTab for OrcVTab {
 
         let reader = ArrowReaderBuilder::try_new(file)
             .map_err(|e| format!("read_orc: not a valid ORC file '{}': {e}", file_path))?
+            .with_batch_size(BATCH_SIZE)
             .build();
 
         let schema = reader.schema();
@@ -71,6 +78,7 @@ impl VTab for OrcVTab {
     fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
         Ok(OrcInitData {
             done: AtomicBool::new(false),
+            reader: Mutex::new(None),
         })
     }
 
@@ -86,31 +94,37 @@ impl VTab for OrcVTab {
             return Ok(());
         }
 
-        let file = File::open(&bind_data.file_path).map_err(|e| {
-            format!("read_orc: cannot re-open '{}': {e}", bind_data.file_path)
-        })?;
+        let mut reader_guard = init_data.reader.lock().unwrap();
 
-        let mut reader = ArrowReaderBuilder::try_new(file)
-            .map_err(|e| format!("read_orc: failed to create reader: {e}"))?
-            .build();
+        // Lazy-init the reader on first call
+        if reader_guard.is_none() {
+            let file = File::open(&bind_data.file_path)
+                .map_err(|e| format!("read_orc: cannot open '{}': {e}", bind_data.file_path))?;
+            let reader = ArrowReaderBuilder::try_new(file)
+                .map_err(|e| format!("read_orc: failed to create reader: {e}"))?
+                .with_batch_size(BATCH_SIZE)
+                .build();
+            *reader_guard = Some(reader);
+        }
 
-        // Emit the first batch. For multi-batch streaming, this would need
-        // stateful iteration across multiple func() calls.
+        let reader = reader_guard.as_mut().unwrap();
+
         match reader.next() {
             Some(Ok(batch)) => {
                 record_batch_to_duckdb_data_chunk(&batch, output)?;
             }
             Some(Err(e)) => {
+                init_data.done.store(true, Ordering::Relaxed);
                 return Err(
                     format!("read_orc: error reading '{}': {e}", bind_data.file_path).into(),
                 );
             }
             None => {
+                init_data.done.store(true, Ordering::Relaxed);
                 output.set_len(0);
             }
         }
 
-        init_data.done.store(true, Ordering::Relaxed);
         Ok(())
     }
 
