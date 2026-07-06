@@ -5,6 +5,7 @@ edition = "2021"
 description = "DuckDB extension for reading Apache ORC files"
 
 [lib]
+name = "orc"
 crate-type = ["cdylib"]
 
 [profile.release]

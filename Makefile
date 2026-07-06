@@ -1,42 +1,29 @@
-.PHONY: clean debug release test
+.PHONY: clean clean_all
 
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-DUCKDB_VERSION ?= v1.5.4
-EXT_VERSION    ?= 0.1.0
-PLATFORM       ?= linux_amd64
+EXTENSION_NAME=orc
 
-debug: build/debug/extension/orc/orc.duckdb_extension
+# Set to 1 to enable Unstable API
+USE_UNSTABLE_C_API=0
 
-release: build/release/extension/orc/orc.duckdb_extension
+# Target DuckDB version
+TARGET_DUCKDB_VERSION=v1.5.4
 
-build/debug/extension/orc/orc.duckdb_extension: target/debug/libduckdb_orc.so scripts/metadata.py
-	@mkdir -p $(dir $@)
-	@python3 $(PROJ_DIR)scripts/metadata.py $< -o $@ \
-		--platform $(PLATFORM) \
-		--duckdb-version $(DUCKDB_VERSION) \
-		--extension-version $(EXT_VERSION)
-	@echo "  → $@"
+all: configure debug
 
-build/release/extension/orc/orc.duckdb_extension: target/release/libduckdb_orc.so scripts/metadata.py
-	@mkdir -p $(dir $@)
-	@python3 $(PROJ_DIR)scripts/metadata.py $< -o $@ \
-		--platform $(PLATFORM) \
-		--duckdb-version $(DUCKDB_VERSION) \
-		--extension-version $(EXT_VERSION)
-	@echo "  → $@"
+# Include makefiles from DuckDB
+include extension-ci-tools/makefiles/c_api_extensions/base.Makefile
+include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 
-target/debug/libduckdb_orc.so:
-	cargo build
+configure: venv platform extension_version
 
-target/release/libduckdb_orc.so:
-	cargo build --release
+debug: build_extension_library_debug build_extension_with_metadata_debug
+release: build_extension_library_release build_extension_with_metadata_release
 
-test: debug
-	@duckdb -unsigned -c "LOAD 'build/debug/extension/orc/orc.duckdb_extension'; SELECT 'OK' as status, version() as duckdb_version;"
+test: test_debug
+test_debug: test_extension_debug
+test_release: test_extension_release
 
-clean:
-	cargo clean
-	rm -rf build
-
-.PHONY: debug release test clean
+clean: clean_build clean_rust
+clean_all: clean_configure clean
