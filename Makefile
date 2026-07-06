@@ -10,6 +10,9 @@ USE_UNSTABLE_C_API=0
 # Target DuckDB version
 TARGET_DUCKDB_VERSION=v1.5.4
 
+# Skip tests — CI doesn't have ORC test data yet
+SKIP_TESTS=1
+
 all: configure debug
 
 # Include makefiles from DuckDB
