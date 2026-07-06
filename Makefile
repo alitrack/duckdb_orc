@@ -1,28 +1,32 @@
-.PHONY: clean clean_all debug release
+.PHONY: clean debug release test
 
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
-EXTENSION_NAME := orc
-SO_FILE := $(PROJ_DIR)target/debug/libduckdb_orc.so
-OUTPUT := $(PROJ_DIR)build/debug/extension/orc/orc.duckdb_extension
 
-all: debug
+debug: build/debug/extension/orc/orc.duckdb_extension
 
-debug:
+release: build/release/extension/orc/orc.duckdb_extension
+
+build/debug/extension/orc/orc.duckdb_extension: target/debug/libduckdb_orc.so scripts/metadata.py
+	@mkdir -p $(dir $@)
+	@python3 $(PROJ_DIR)scripts/metadata.py $< -o $@
+	@echo "  → $@"
+
+build/release/extension/orc/orc.duckdb_extension: target/release/libduckdb_orc.so scripts/metadata.py
+	@mkdir -p $(dir $@)
+	@python3 $(PROJ_DIR)scripts/metadata.py $< -o $@
+	@echo "  → $@"
+
+target/debug/libduckdb_orc.so:
 	cargo build
-	mkdir -p $(dir $(OUTPUT))
-	python3 $(PROJ_DIR)scripts/metadata.py $(SO_FILE) -o $(OUTPUT)
 
-release:
+target/release/libduckdb_orc.so:
 	cargo build --release
-	mkdir -p $(PROJ_DIR)build/release/extension/orc/
-	python3 $(PROJ_DIR)scripts/metadata.py $(PROJ_DIR)target/release/libduckdb_orc.so -o $(PROJ_DIR)build/release/extension/orc/orc.duckdb_extension
 
-test:
-	@echo "Tests require DuckDB with -unsigned flag"
-	@echo "Run: duckdb -unsigned -c \"LOAD '$(OUTPUT)'; SELECT * FROM read_orc('test.orc');\""
+test: debug
+	@duckdb -unsigned -c "LOAD 'build/debug/extension/orc/orc.duckdb_extension'; SELECT 'OK' as status, version() as duckdb_version;"
 
 clean:
 	cargo clean
 	rm -rf build
 
-.PHONY: debug release test clean all
+.PHONY: debug release test clean
