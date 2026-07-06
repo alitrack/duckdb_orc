@@ -7,8 +7,8 @@ EXTENSION_NAME=orc
 # Set to 1 to enable Unstable API
 USE_UNSTABLE_C_API=0
 
-# Target DuckDB version
-TARGET_DUCKDB_VERSION=v1.5.4
+# Target DuckDB version (must match C API version, not DuckDB release version)
+TARGET_DUCKDB_VERSION=v1.2.0
 
 # Skip tests — CI doesn't have ORC test data yet
 SKIP_TESTS=1
