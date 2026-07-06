@@ -17,7 +17,7 @@ Built on top of [`orc-rust`](https://github.com/datafusion-contrib/orc-rust), a 
 | Feature | Status | Notes |
 |---|---|---|
 | Filter / predicate pushdown | ❌ | **Blocked** — DuckDB C extension API does not expose `duckdb_table_function_supports_filter_pushdown`. Requires upstream DuckDB change. Workaround: DuckDB still applies filters after scan; projection pushdown works. |
-| Multi-file / glob | ❌ | Single file path only. `read_orc('*.orc')` not yet supported. |
+| Multi-file / glob | ✅ | `read_orc('data/*.orc')` — all files must have identical schema. |
 | Write support | ❌ | Read-only. |
 | Community extension | ❌ | Not yet submitted to `duckdb/community-extensions`. |
 

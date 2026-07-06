@@ -14,7 +14,7 @@ use std::{
     fs::File,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -23,17 +23,21 @@ use orc_rust::ArrowReader;
 /// DuckDB's STANDARD_VECTOR_SIZE — batches must not exceed this.
 const BATCH_SIZE: usize = 2048;
 
-/// Per-scan state: tracks whether the scan is done and holds the active reader.
+/// Per-scan state: tracks current file index, completion flag, and active reader.
 #[repr(C)]
 struct OrcInitData {
+    /// True when all files have been fully read.
     done: AtomicBool,
+    /// Index of the file currently being read.
+    file_index: AtomicUsize,
+    /// Active reader for the current file path.
     reader: Mutex<Option<ArrowReader<File>>>,
 }
 
-/// Bound parameters from the `read_orc(file_path)` call.
+/// Bound parameters: file paths (expanded from glob) and schema.
 #[repr(C)]
 struct OrcBindData {
-    file_path: String,
+    file_paths: Vec<String>,
     schema: Arc<arrow::datatypes::Schema>,
 }
 
@@ -46,38 +50,64 @@ impl VTab for OrcVTab {
     fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
         let param_count = bind.get_parameter_count();
         if param_count != 1 {
-            return Err(
-                format!("read_orc: expected 1 parameter (file path), got {param_count}").into(),
-            );
+            return Err(format!(
+                "read_orc: expected 1 parameter (file path or glob), got {param_count}"
+            )
+            .into());
         }
-        let file_path = bind.get_parameter(0).to_string();
+        let pattern = bind.get_parameter(0).to_string();
 
-        // Open file and peek at schema
-        let file = File::open(&file_path)
-            .map_err(|e| format!("read_orc: cannot open '{}': {e}", file_path))?;
+        let mut file_paths: Vec<String> = glob::glob(&pattern)
+            .map_err(|e| format!("read_orc: invalid glob pattern '{pattern}': {e}"))?
+            .filter_map(|entry| entry.ok())
+            .filter_map(|path| path.to_str().map(String::from))
+            .collect();
+
+        if file_paths.is_empty() {
+            return Err(format!("read_orc: no files found matching '{pattern}'").into());
+        }
+
+        file_paths.sort();
+
+        // Peek at first file for schema
+        let file = File::open(&file_paths[0])
+            .map_err(|e| format!("read_orc: cannot open '{}': {e}", file_paths[0]))?;
 
         let reader = ArrowReaderBuilder::try_new(file)
-            .map_err(|e| format!("read_orc: not a valid ORC file '{}': {e}", file_path))?
+            .map_err(|e| format!("read_orc: not a valid ORC file '{}': {e}", file_paths[0]))?
             .with_batch_size(BATCH_SIZE)
             .build();
 
         let schema = reader.schema();
 
-        // Register columns with DuckDB
+        // Validate all matched files have the same schema
+        for path in &file_paths[1..] {
+            let f = File::open(path)
+                .map_err(|e| format!("read_orc: cannot open '{path}': {e}"))?;
+            let r = ArrowReaderBuilder::try_new(f)
+                .map_err(|e| format!("read_orc: not a valid ORC file '{path}': {e}"))?
+                .with_batch_size(BATCH_SIZE)
+                .build();
+            if r.schema() != schema {
+                return Err(format!(
+                    "read_orc: schema mismatch — '{}' has different columns than '{}'. All files in a glob must have identical schemas.",
+                    path, file_paths[0]
+                ).into());
+            }
+        }
+
         for field in schema.fields() {
             let duckdb_type = to_duckdb_logical_type(field.data_type())?;
             bind.add_result_column(field.name(), duckdb_type);
         }
 
-        Ok(OrcBindData {
-            file_path,
-            schema,
-        })
+        Ok(OrcBindData { file_paths, schema })
     }
 
     fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
         Ok(OrcInitData {
             done: AtomicBool::new(false),
+            file_index: AtomicUsize::new(0),
             reader: Mutex::new(None),
         })
     }
@@ -94,38 +124,55 @@ impl VTab for OrcVTab {
             return Ok(());
         }
 
-        let mut reader_guard = init_data.reader.lock().unwrap();
+        // Keep trying files until we get a batch or run out.
+        loop {
+            let mut reader_guard = init_data.reader.lock().unwrap();
 
-        // Lazy-init the reader on first call
-        if reader_guard.is_none() {
-            let file = File::open(&bind_data.file_path)
-                .map_err(|e| format!("read_orc: cannot open '{}': {e}", bind_data.file_path))?;
-            let reader = ArrowReaderBuilder::try_new(file)
-                .map_err(|e| format!("read_orc: failed to create reader: {e}"))?
-                .with_batch_size(BATCH_SIZE)
-                .build();
-            *reader_guard = Some(reader);
+            // Open reader for current file index if needed.
+            if reader_guard.is_none() {
+                let idx = init_data.file_index.load(Ordering::Relaxed);
+                if idx >= bind_data.file_paths.len() {
+                    init_data.done.store(true, Ordering::Relaxed);
+                    output.set_len(0);
+                    return Ok(());
+                }
+
+                let file_path = &bind_data.file_paths[idx];
+                let file = File::open(file_path)
+                    .map_err(|e| format!("read_orc: cannot open '{file_path}': {e}"))?;
+                let reader = ArrowReaderBuilder::try_new(file)
+                    .map_err(|e| format!("read_orc: failed to create reader for '{file_path}': {e}"))?
+                    .with_batch_size(BATCH_SIZE)
+                    .build();
+                *reader_guard = Some(reader);
+            }
+
+            let reader = reader_guard.as_mut().unwrap();
+
+            match reader.next() {
+                Some(Ok(batch)) => {
+                    drop(reader_guard);
+                    record_batch_to_duckdb_data_chunk(&batch, output)?;
+                    return Ok(());
+                }
+                Some(Err(e)) => {
+                    let idx = init_data.file_index.load(Ordering::Relaxed);
+                    init_data.done.store(true, Ordering::Relaxed);
+                    return Err(format!(
+                        "read_orc: error reading '{}': {e}",
+                        bind_data.file_paths[idx]
+                    )
+                    .into());
+                }
+                None => {
+                    // File exhausted — advance to next file.
+                    *reader_guard = None;
+                    drop(reader_guard);
+                    init_data.file_index.fetch_add(1, Ordering::Relaxed);
+                    // Loop: next iteration opens the next file.
+                }
+            }
         }
-
-        let reader = reader_guard.as_mut().unwrap();
-
-        match reader.next() {
-            Some(Ok(batch)) => {
-                record_batch_to_duckdb_data_chunk(&batch, output)?;
-            }
-            Some(Err(e)) => {
-                init_data.done.store(true, Ordering::Relaxed);
-                return Err(
-                    format!("read_orc: error reading '{}': {e}", bind_data.file_path).into(),
-                );
-            }
-            None => {
-                init_data.done.store(true, Ordering::Relaxed);
-                output.set_len(0);
-            }
-        }
-
-        Ok(())
     }
 
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
@@ -133,7 +180,6 @@ impl VTab for OrcVTab {
     }
 }
 
-/// Extension entry point — registers `read_orc` table function.
 #[duckdb_entrypoint_c_api(ext_name = "orc")]
 pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
     con.register_table_function::<OrcVTab>("read_orc")?;
