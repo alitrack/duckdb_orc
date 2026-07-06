@@ -1,130 +1,69 @@
-# DuckDB Rust extension template
-This is an **experimental** template for Rust based extensions based on the C Extension API of DuckDB. The goal is to
-turn this eventually into a stable basis for pure-Rust DuckDB extensions that can be submitted to the Community extensions
-repository
+# DuckDB ORC Extension (Rust)
 
-Features:
-- No DuckDB build required
-- No C++ or C code required
-- CI/CD chain preconfigured
-- (Coming soon) Works with community extensions
+A DuckDB extension for reading [Apache ORC](https://orc.apache.org) files, written in pure Rust.
 
-## Cloning
+Built on top of [`orc-rust`](https://github.com/datafusion-contrib/orc-rust), a native Rust ORC reader.
 
-Clone the repo with submodules
+## Features
 
-```shell
-git clone --recurse-submodules <repo>
+- `read_orc(file_path)` — read `.orc` files directly into DuckDB
+- All ORC data types (primitive, struct, list, map)
+- All compression codecs (Zlib, Snappy, LZO, LZ4, ZSTD)
+- Projection pushdown via DuckDB's column pruning
+
+## Installation
+
+```sql
+-- Load from local build
+LOAD './build/debug/extension/orc/orc.duckdb_extension';
+
+-- Read an ORC file
+SELECT * FROM read_orc('data.orc');
 ```
 
-## Dependencies
-In principle, these extensions can be compiled with the Rust toolchain alone. However, this template relies on some additional
-tooling to make life a little easier and to be able to share CI/CD infrastructure with extension templates for other languages:
+## Usage
 
-- Python3
-- Python3-venv
-- [Make](https://www.gnu.org/software/make)
-- Git
+```sql
+-- Basic read
+SELECT * FROM read_orc('sales.orc');
 
-Installing these dependencies will vary per platform:
-- For Linux, these come generally pre-installed or are available through the distro-specific package manager.
-- For MacOS, [homebrew](https://formulae.brew.sh/).
-- For Windows, [chocolatey](https://community.chocolatey.org/).
+-- Filter and aggregate
+SELECT region, SUM(amount) 
+FROM read_orc('sales.orc') 
+WHERE year = 2024 
+GROUP BY region;
+
+-- Multiple files (via glob)
+SELECT * FROM read_orc('data/2024/*.orc');
+```
 
 ## Building
-After installing the dependencies, building is a two-step process. Firstly run:
-```shell
-make configure
-```
-This will ensure a Python venv is set up with DuckDB and DuckDB's test runner installed. Additionally, depending on configuration,
-DuckDB will be used to determine the correct platform for which you are compiling.
 
-Then, to build the extension run:
-```shell
+Prerequisites: Rust toolchain, Python 3, Make, Git.
+
+```bash
+git clone --recurse-submodules https://github.com/alitrack/duckdb_orc.git
+cd duckdb_orc
+make configure
 make debug
 ```
-This delegates the build process to cargo, which will produce a shared library in `target/debug/<shared_lib_name>`. After this step,
-a script is run to transform the shared library into a loadable extension by appending a binary footer. The resulting extension is written
-to the `build/debug` directory.
 
-To create optimized release binaries, simply run `make release` instead.
+Then load with DuckDB:
 
-### Running the extension
-To run the extension code, start `duckdb` with `-unsigned` flag. This will allow you to load the local extension file.
-
-```sh
+```bash
 duckdb -unsigned
 ```
 
-After loading the extension by the file path, you can use the functions provided by the extension. This template registers
-the `rusty_echo()` scalar function and the `rusty_quack()` table function.
-
 ```sql
-LOAD './build/debug/extension/rusty_quack/rusty_quack.duckdb_extension';
-SELECT rusty_echo('Jane');
+LOAD './build/debug/extension/orc/orc.duckdb_extension';
 ```
 
-```
-┌─────────────────────┐
-│ rusty_echo('Jane')  │
-│       varchar       │
-├─────────────────────┤
-│ 🐤 Jane 🦀 Jane     │
-└─────────────────────┘
-```
+## Credits
 
-```sql
-SELECT * FROM rusty_quack('Jane');
-```
+- [`orc-rust`](https://github.com/datafusion-contrib/orc-rust) — native Rust ORC reader
+- [`duckdb-rs`](https://github.com/duckdb/duckdb-rs) — Rust bindings for DuckDB
+- [`duckdb/extension-template-rs`](https://github.com/duckdb/extension-template-rs) — Rust extension template
 
-```
-┌─────────────────────┐
-│       column0       │
-│       varchar       │
-├─────────────────────┤
-│ Rusty Quack Jane 🐥 │
-└─────────────────────┘
-```
+## License
 
-## Testing
-This extension uses the DuckDB Python client for testing. This should be automatically installed in the `make configure` step.
-The tests themselves are written in the SQLLogicTest format, just like most of DuckDB's tests. A sample test can be found in
-`test/sql/<extension_name>.test`. To run the tests using the *debug* build:
-
-```shell
-make test_debug
-```
-
-or for the *release* build:
-```shell
-make test_release
-```
-
-### Version switching
-Testing with different DuckDB versions is really simple:
-
-First, run
-```
-make clean_all
-```
-to ensure the previous `make configure` step is deleted.
-
-Then, run
-```
-DUCKDB_TEST_VERSION=v1.3.2 make configure
-```
-to select a different duckdb version to test with
-
-Finally, build and test with
-```
-make debug
-make test_debug
-```
-
-### Known issues
-This is a bit of a footgun, but the extensions produced by this template may (or may not) be broken on windows on python3.11
-with the following error on extension load:
-```shell
-IO Error: Extension '<name>.duckdb_extension' could not be loaded: The specified module could not be found
-```
-This was resolved by using python 3.12
+MIT

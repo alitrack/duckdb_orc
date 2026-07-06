@@ -1,7 +1,8 @@
 [package]
-name = "rusty_quack"
+name = "duckdb_orc"
 version = "0.1.0"
 edition = "2021"
+description = "DuckDB extension for reading Apache ORC files"
 
 [lib]
 crate-type = ["cdylib"]
@@ -11,13 +12,11 @@ lto = true
 strip = true
 
 [[example]]
-# crate-type can't be (at the moment) be overriden for specific targets
-# src/wasm_lib.rs forwards to src/lib.rs so that we can change from cdylib
-# (that is needed while compiling natively) to staticlib (needed since the
-# actual linking will be done via emcc
-name = "rusty_quack"
+name = "duckdb_orc"
 path = "src/wasm_lib.rs"
 crate-type = ["staticlib"]
 
 [dependencies]
 duckdb = { version = "~1.10504.0", features = ["loadable-extension", "vscalar"] }
+orc-rust = "0.8"
+arrow = "58"

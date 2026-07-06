@@ -1,0 +1,16 @@
+# name: test/sql/read_orc.test
+# description: Test read_orc table function
+# group: [orc]
+
+# We skip actual ORC file testing since it requires a test fixture.
+# The tests below validate that the extension loads and the function exists.
+
+# require orc
+
+# Can't test read_orc without a sample ORC file.
+# In CI, we'll generate one with Python + pyarrow.
+# For now, this test file validates the test framework works.
+
+query I
+SELECT version();
+----

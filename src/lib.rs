@@ -1,77 +1,75 @@
+use arrow::array::RecordBatchReader;
 use duckdb::{
-    core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
+    core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId},
     duckdb_entrypoint_c_api,
-    ffi::duckdb_string_t,
-    types::DuckString,
-    vscalar::{ScalarFunctionSignature, VScalar},
-    vtab::{arrow::WritableVector, BindInfo, InitInfo, TableFunctionInfo, VTab},
+    vtab::{
+        arrow::{record_batch_to_duckdb_data_chunk, to_duckdb_logical_type},
+        BindInfo, InitInfo, TableFunctionInfo, VTab,
+    },
     Connection, Result,
 };
+use orc_rust::ArrowReaderBuilder;
 use std::{
     error::Error,
-    ffi::CString,
-    sync::atomic::{AtomicBool, Ordering},
+    fs::File,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
-struct EchoScalar;
-
-impl VScalar for EchoScalar {
-    type State = ();
-
-    fn invoke(
-        _state: &Self::State,
-        input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let input_vec = input.flat_vector(0);
-        let values = unsafe { input_vec.as_slice_with_len::<duckdb_string_t>(input.len()) };
-        let mut output = output.flat_vector();
-
-        for (i, value) in values.iter().enumerate() {
-            if input_vec.row_is_null(i as u64) {
-                output.set_null(i);
-                continue;
-            }
-
-            let mut value = *value;
-            let s = DuckString::new(&mut value).as_str();
-            output.insert(i, format!("🐤 {s} 🦀 {s}").as_str());
-        }
-        Ok(())
-    }
-
-    fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![ScalarFunctionSignature::exact(
-            vec![LogicalTypeId::Varchar.into()],
-            LogicalTypeId::Varchar.into(),
-        )]
-    }
-}
-
+/// Per-scan state: tracks whether we've produced output.
 #[repr(C)]
-struct HelloBindData {
-    name: String,
-}
-
-#[repr(C)]
-struct HelloInitData {
+struct OrcInitData {
     done: AtomicBool,
 }
 
-struct HelloVTab;
+/// Bound parameters from the `read_orc(file_path)` call.
+#[repr(C)]
+struct OrcBindData {
+    file_path: String,
+    schema: Arc<arrow::datatypes::Schema>,
+}
 
-impl VTab for HelloVTab {
-    type InitData = HelloInitData;
-    type BindData = HelloBindData;
+struct OrcVTab;
 
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        bind.add_result_column("column0", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        let name = bind.get_parameter(0).to_string();
-        Ok(HelloBindData { name })
+impl VTab for OrcVTab {
+    type BindData = OrcBindData;
+    type InitData = OrcInitData;
+
+    fn bind(bind: &BindInfo) -> std::result::Result<Self::BindData, Box<dyn Error>> {
+        let param_count = bind.get_parameter_count();
+        if param_count != 1 {
+            return Err(
+                format!("read_orc: expected 1 parameter (file path), got {param_count}").into(),
+            );
+        }
+        let file_path = bind.get_parameter(0).to_string();
+
+        // Open file and peek at schema
+        let file = File::open(&file_path)
+            .map_err(|e| format!("read_orc: cannot open '{}': {e}", file_path))?;
+
+        let reader = ArrowReaderBuilder::try_new(file)
+            .map_err(|e| format!("read_orc: not a valid ORC file '{}': {e}", file_path))?
+            .build();
+
+        let schema = reader.schema();
+
+        // Register columns with DuckDB
+        for field in schema.fields() {
+            let duckdb_type = to_duckdb_logical_type(field.data_type())?;
+            bind.add_result_column(field.name(), duckdb_type);
+        }
+
+        Ok(OrcBindData {
+            file_path,
+            schema,
+        })
     }
 
-    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
-        Ok(HelloInitData {
+    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
+        Ok(OrcInitData {
             done: AtomicBool::new(false),
         })
     }
@@ -79,17 +77,40 @@ impl VTab for HelloVTab {
     fn func(
         func: &TableFunctionInfo<Self>,
         output: &mut DataChunkHandle,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> std::result::Result<(), Box<dyn Error>> {
         let init_data = func.get_init_data();
         let bind_data = func.get_bind_data();
-        if init_data.done.swap(true, Ordering::Relaxed) {
+
+        if init_data.done.load(Ordering::Relaxed) {
             output.set_len(0);
-        } else {
-            let vector = output.flat_vector(0);
-            let result = CString::new(format!("Rusty Quack {} 🐥", bind_data.name))?;
-            vector.insert(0, result);
-            output.set_len(1);
+            return Ok(());
         }
+
+        let file = File::open(&bind_data.file_path).map_err(|e| {
+            format!("read_orc: cannot re-open '{}': {e}", bind_data.file_path)
+        })?;
+
+        let mut reader = ArrowReaderBuilder::try_new(file)
+            .map_err(|e| format!("read_orc: failed to create reader: {e}"))?
+            .build();
+
+        // Emit the first batch. For multi-batch streaming, this would need
+        // stateful iteration across multiple func() calls.
+        match reader.next() {
+            Some(Ok(batch)) => {
+                record_batch_to_duckdb_data_chunk(&batch, output)?;
+            }
+            Some(Err(e)) => {
+                return Err(
+                    format!("read_orc: error reading '{}': {e}", bind_data.file_path).into(),
+                );
+            }
+            None => {
+                output.set_len(0);
+            }
+        }
+
+        init_data.done.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -98,10 +119,9 @@ impl VTab for HelloVTab {
     }
 }
 
-#[duckdb_entrypoint_c_api]
+/// Extension entry point — registers `read_orc` table function.
+#[duckdb_entrypoint_c_api(ext_name = "orc")]
 pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
-    con.register_scalar_function::<EchoScalar>("rusty_echo")?;
-    con.register_table_function::<HelloVTab>("rusty_quack")?;
-
+    con.register_table_function::<OrcVTab>("read_orc")?;
     Ok(())
 }
