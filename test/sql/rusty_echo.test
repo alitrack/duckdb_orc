@@ -1,0 +1,65 @@
+# name: test/sql/rusty_echo.test
+# description: test rusty_echo scalar function
+# group: [quack]
+
+# Before we load the extension, this will fail
+statement error
+SELECT rusty_echo('x');
+----
+Catalog Error: Scalar Function with name rusty_echo does not exist!
+
+# Require statement will ensure the extension is loaded from now on
+require rusty_quack
+
+# Confirm the extension works
+query T
+SELECT rusty_echo(col0) FROM values ('Hello'), ('rusty'), ('world') as v;
+----
+🐤 Hello 🦀 Hello
+🐤 rusty 🦀 rusty
+🐤 world 🦀 world
+
+# Constant NULL inputs are folded to NULL.
+query T
+SELECT rusty_echo(NULL);
+----
+NULL
+
+# Runtime NULLs in regular input chunks must be masked by the scalar function.
+query T
+SELECT rusty_echo(s) FROM (VALUES (1, 'a'), (2, NULL), (3, 'b')) v(i, s) ORDER BY i;
+----
+🐤 a 🦀 a
+NULL
+🐤 b 🦀 b
+
+# Empty string: surface it via length and a hex digest, since trailing
+# whitespace in the literal template output is fragile under sqllogictest.
+query II
+SELECT length(rusty_echo('')), md5(rusty_echo(''));
+----
+5	07058a80443e7a547044e2a53aea9304
+
+# Non-ASCII inputs round-trip through DuckString.
+query T
+SELECT rusty_echo(col0) FROM values ('привет'), ('你好') as v;
+----
+🐤 привет 🦀 привет
+🐤 你好 🦀 你好
+
+# Exact signature: wrong arity / wrong type is rejected by the binder.
+statement error
+SELECT rusty_echo();
+----
+Binder Error
+
+statement error
+SELECT rusty_echo(42);
+----
+Binder Error
+
+# Inputs spanning multiple DataChunks (STANDARD_VECTOR_SIZE = 2048).
+query II
+SELECT count(*), count(DISTINCT rusty_echo(s::VARCHAR)) FROM range(3000) t(s);
+----
+3000	3000
