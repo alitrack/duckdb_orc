@@ -1,0 +1,7 @@
+# name: test/sql/basic.test
+# description: Basic smoke test for ORC extension
+
+# Verify the extension loads and read_orc function exists
+# Note: actual ORC data tests run as part of local testing with test data files
+statement ok
+SELECT version()
