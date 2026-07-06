@@ -6,3 +6,4 @@ duckdb_unittest_tempdir
 /test/bin
 venvconfigure/
 build/
+test/sql/test.orc
