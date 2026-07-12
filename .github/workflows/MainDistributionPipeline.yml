@@ -35,8 +35,39 @@ jobs:
           path: artifacts
           merge-multiple: false
 
+      - name: Rename release assets with platform suffix
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          shopt -s nullglob
+
+          for artifact_dir in artifacts/*; do
+            [ -d "$artifact_dir" ] || continue
+            artifact_name=$(basename "$artifact_dir")
+            platform_suffix="${artifact_name##*-extension-}"
+
+            for asset in "$artifact_dir"/*.duckdb_extension "$artifact_dir"/*.duckdb_extension.wasm; do
+              [ -f "$asset" ] || continue
+              asset_name=$(basename "$asset")
+
+              if [[ "$asset_name" == *.duckdb_extension.wasm ]]; then
+                extension_suffix=".duckdb_extension.wasm"
+                stem="${asset_name%.duckdb_extension.wasm}"
+              else
+                extension_suffix=".duckdb_extension"
+                stem="${asset_name%.duckdb_extension}"
+              fi
+
+              cp "$asset" "release-assets/${stem}-${platform_suffix}${extension_suffix}"
+            done
+          done
+
+          test -n "$(find release-assets -type f | head -1)"
+          find release-assets -type f | sort
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*.duckdb_extension
+          files: release-assets/*
           generate_release_notes: true
