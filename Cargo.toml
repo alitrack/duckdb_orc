@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "DuckDB extension for reading Apache ORC files"
 
+[features]
+default = []
+extension = ["duckdb/loadable-extension"]
+
 [lib]
 name = "orc"
 crate-type = ["cdylib"]
@@ -18,7 +22,7 @@ path = "src/wasm_lib.rs"
 crate-type = ["staticlib"]
 
 [dependencies]
-duckdb = { version = "~1.10504.0", features = ["loadable-extension", "vscalar"] }
+duckdb = { version = "~1.10504.0", features = ["vtab-arrow", "bundled"] }
 orc-rust = "0.8"
 arrow = "58"
 glob = "0.3"

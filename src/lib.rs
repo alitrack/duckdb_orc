@@ -1,13 +1,13 @@
 use arrow::array::RecordBatchReader;
 use duckdb::{
     core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId},
-    duckdb_entrypoint_c_api,
     vtab::{
         arrow::{record_batch_to_duckdb_data_chunk, to_duckdb_logical_type},
         BindInfo, InitInfo, TableFunctionInfo, VTab,
     },
-    Connection, Result,
 };
+#[cfg(feature = "extension")]
+use duckdb::{Connection, duckdb_entrypoint_c_api};
 use orc_rust::ArrowReaderBuilder;
 use std::{
     error::Error,
@@ -21,6 +21,7 @@ use std::{
 use orc_rust::ArrowReader;
 
 /// DuckDB's STANDARD_VECTOR_SIZE — batches must not exceed this.
+#[cfg_attr(not(feature = "extension"), allow(dead_code))]
 const BATCH_SIZE: usize = 2048;
 
 /// Per-scan state: tracks current file index, completion flag, and active reader.
@@ -41,6 +42,7 @@ struct OrcBindData {
     schema: Arc<arrow::datatypes::Schema>,
 }
 
+#[cfg_attr(not(feature = "extension"), allow(dead_code))]
 struct OrcVTab;
 
 impl VTab for OrcVTab {
@@ -180,6 +182,7 @@ impl VTab for OrcVTab {
     }
 }
 
+#[cfg(feature = "extension")]
 #[duckdb_entrypoint_c_api(ext_name = "orc")]
 pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
     con.register_table_function::<OrcVTab>("read_orc")?;

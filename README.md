@@ -57,7 +57,29 @@ make debug
 
 # Release build (optimized, ~10MB)
 make release
+
+# Rust integration test (client mode, not loadable-extension mode)
+cargo test --test integration_test -- --nocapture
 ```
+
+## Development notes
+
+This repository intentionally separates **extension build mode** from **Rust client/test mode**:
+
+- `make debug` / `make release` build the loadable DuckDB extension with `--features extension`
+- `cargo test` runs without that feature so `duckdb::Connection::open_in_memory()` works normally
+
+Why this matters:
+
+- `duckdb/loadable-extension` replaces parts of the regular DuckDB client API with extension-entrypoint wrappers
+- if that feature is enabled during normal Rust tests, `Connection::open_in_memory()` can fail with:
+  - `DuckDB API not initialized or DuckDB feature omitted`
+
+Recommended workflow:
+
+1. Build the extension with `make debug` or `make release`
+2. Run Rust integration tests with plain `cargo test ...`
+3. Optionally verify the built artifact in DuckDB CLI with `duckdb -unsigned`
 
 Load with DuckDB (requires `-unsigned` for locally-built extensions):
 
