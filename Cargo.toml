@@ -17,7 +17,7 @@ lto = true
 strip = true
 
 [[example]]
-name = "duckdb_orc"
+name = "orc"
 path = "src/wasm_lib.rs"
 crate-type = ["staticlib"]
 
