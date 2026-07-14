@@ -18,8 +18,9 @@ Built on top of [`orc-rust`](https://github.com/datafusion-contrib/orc-rust), a 
 |---|---|---|
 | Filter / predicate pushdown | ❌ | **Blocked** — DuckDB C extension API does not expose `duckdb_table_function_supports_filter_pushdown`. Requires upstream DuckDB change. Workaround: DuckDB still applies filters after scan; projection pushdown works. |
 | Multi-file / glob | ✅ | `read_orc('data/*.orc')` — all files must have identical schema. |
-| Write support | ❌ | Read-only. |
-| Community extension | ❌ | Not yet submitted to `duckdb/community-extensions`. |
+| Write support | ⚠️ | `orc-rust` 0.8+ now has `ArrowWriter` with full write support, **but compression is not yet implemented** (uncompressed ORC only). Write support will be added to `duckdb_orc` once `orc-rust` supports compressed writes. |
+| Parallel scan | ❌ | Currently single-threaded sequential scan. For single large files, DuckDB's native Parquet reader is ~5x faster due to built-in row-group parallelism. See [Parallelism](#parallelism) below. |
+| Community extension | ❌ | [PR submitted](https://github.com/duckdb/community-extensions/pull/2239), pending review. |
 
 ## Installation
 
@@ -61,6 +62,30 @@ make release
 # Rust integration test (client mode, not loadable-extension mode)
 cargo test --test integration_test -- --nocapture
 ```
+
+## Parallelism
+
+`read_orc` currently scans files sequentially in a single thread. This is a known limitation:
+
+- **Single file**: ~5x slower than DuckDB's native Parquet reader on large files (100M rows: 42s vs 7.6s). DuckDB's Parquet reader parallelizes across row groups natively.
+- **Multi-file glob**: each file is read sequentially in alphabetical order.
+
+### Workaround for better performance
+
+For single-file performance, convert ORC to Parquet first:
+
+```bash
+python3 -c "
+import pyarrow.orc as orc; import pyarrow.parquet as pq
+pq.write_table(orc.read_table('data.orc'), 'data.parquet')
+"
+```
+
+Then query the Parquet file in DuckDB — it will benefit from native row-group parallelism.
+
+### Future improvements
+
+ORC files are organized in **stripes** (analogous to Parquet row groups). `orc-rust` exposes `with_file_byte_range()` for reading specific byte ranges, which could enable stripe-level parallelism in a future version of `duckdb_orc`.
 
 ## Development notes
 
