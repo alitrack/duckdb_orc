@@ -32,11 +32,18 @@ Built on top of [`orc-rust`](https://github.com/datafusion-contrib/orc-rust), a 
 ## Installation
 
 ```sql
--- Load from local build (unsigned — requires `duckdb -unsigned`)
-LOAD './build/debug/extension/orc/orc.duckdb_extension';
+-- Install from the DuckDB community extension registry (v0.2.0+, all platforms)
+INSTALL orc FROM community;
+LOAD orc;
 
 -- Read an ORC file
 SELECT * FROM read_orc('data.orc');
+```
+
+For local development builds (unsigned — requires `duckdb -unsigned`):
+
+```sql
+LOAD './build/debug/extension/orc/orc.duckdb_extension';
 ```
 
 ## Usage
