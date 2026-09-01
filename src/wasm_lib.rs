@@ -1,5 +1,6 @@
 #![allow(special_module_name)]
 
+#[path = "lib.rs"]
 mod lib;
 
 // To build the Wasm target, a `staticlib` crate-type is required
