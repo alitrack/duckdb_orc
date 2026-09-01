@@ -1,5 +1,6 @@
 use duckdb::{
     core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId},
+    ffi,
     vtab::{
         arrow::{record_batch_to_duckdb_data_chunk, to_duckdb_logical_type},
         BindInfo, InitInfo, TableFunctionInfo, VTab,
@@ -19,6 +20,8 @@ use std::{
     },
     thread::{self, JoinHandle},
 };
+
+mod write;
 
 /// DuckDB's STANDARD_VECTOR_SIZE — batches must not exceed this.
 #[cfg_attr(not(feature = "extension"), allow(dead_code))]
@@ -350,9 +353,78 @@ fn launch_parallel_scan(
     Ok(())
 }
 
+// ── Entrypoint ─────────────────────────────────────────────────────────────
+//
+// The `duckdb_entrypoint_c_api` macro doesn't expose the raw `duckdb_connection`
+// handle needed to register a COPY function, so the C entrypoint is written by
+// hand following the same protocol the macro generates (api struct init →
+// get_database → open Connection → call the extension init function).
+
 #[cfg(feature = "extension")]
-#[duckdb_entrypoint_c_api(ext_name = "orc")]
-pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
+pub unsafe fn extension_init(con: &Connection) -> Result<(), Box<dyn Error>> {
     con.register_table_function::<OrcVTab>("read_orc")?;
     Ok(())
+}
+
+#[cfg(feature = "extension")]
+#[no_mangle]
+pub unsafe extern "C" fn orc_init_c_api(
+    info: ffi::duckdb_extension_info,
+    access: *const ffi::duckdb_extension_access,
+) -> bool {
+    unsafe {
+        match orc_init_internal(info, access) {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(e) => {
+                if let Some(set_error_fn) = (*access).set_error {
+                    if let Ok(c) = std::ffi::CString::new(e.to_string()) {
+                        set_error_fn(info, c.as_ptr());
+                    }
+                }
+                false
+            }
+        }
+    }
+}
+
+#[cfg(feature = "extension")]
+unsafe fn orc_init_internal(
+    info: ffi::duckdb_extension_info,
+    access: *const ffi::duckdb_extension_access,
+) -> Result<bool, Box<dyn Error>> {
+    unsafe {
+        // Initialize the extension API struct (same as the proc macro does).
+        let have_api_struct = ffi::duckdb_rs_extension_api_init(info, access, "v1.2.0")?;
+        if !have_api_struct {
+            return Ok(false);
+        }
+
+        let get_database = (*access)
+            .get_database
+            .ok_or("get_database function pointer is null in duckdb_extension_access")?;
+        let db_ptr = get_database(info);
+        if db_ptr.is_null() {
+            return Ok(false);
+        }
+        let db: ffi::duckdb_database = *db_ptr;
+
+        // Register the read table function via the high-level crate.
+        let connection = Connection::open_from_raw(db.cast())?;
+        extension_init(&connection)?;
+
+        // Register the ORC COPY function on a connection to the same database.
+        // DuckDB stores copy functions in the database catalog, so any
+        // connection to this database sees them.
+        let mut con: ffi::duckdb_connection = std::ptr::null_mut();
+        let rc = ffi::duckdb_connect(db, &mut con);
+        if rc != ffi::duckdb_state_DuckDBSuccess {
+            return Err("write_orc: duckdb_connect failed during entrypoint".into());
+        }
+        let reg = write::register_copy_function(con);
+        ffi::duckdb_disconnect(&mut con);
+        reg?;
+
+        Ok(true)
+    }
 }

@@ -1,0 +1,39 @@
+# Test writing ORC via COPY ... TO (FORMAT orc), then reading it back.
+# Column names in ORC output are column_N (C API bind doesn't expose names).
+
+statement ok
+CREATE TABLE src AS SELECT i AS id, 'name_' || i AS name, i * 1.5::DOUBLE AS score,
+  i % 2 = 0 AS even, DATE '2024-01-01' + INTERVAL (i) DAY AS dt,
+  TIMESTAMP '2024-01-01 10:00:00' + INTERVAL (i) MINUTE AS ts
+FROM range(100) t(i);
+
+statement ok
+COPY src TO '__TEST_DIR__/roundtrip.orc' (FORMAT orc);
+
+query I
+SELECT count(*) FROM read_orc('__TEST_DIR__/roundtrip.orc');
+
+100
+
+query T
+SELECT min(column_1) FROM read_orc('__TEST_DIR__/roundtrip.orc');
+
+name_0
+
+query R
+SELECT sum(column_2) FROM read_orc('__TEST_DIR__/roundtrip.orc');
+
+7425.0
+
+# Unsupported types must fail cleanly (LIST), not crash the process.
+statement ok
+CREATE TABLE bad AS SELECT [1,2,3] AS nums FROM range(3);
+
+statement error
+COPY bad TO '__TEST_DIR__/bad.orc' (FORMAT orc);
+
+statement ok
+DROP TABLE src;
+
+statement ok
+DROP TABLE bad;
