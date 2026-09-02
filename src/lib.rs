@@ -8,7 +8,10 @@ use duckdb::{
 };
 #[cfg(feature = "extension")]
 use duckdb::{Connection, duckdb_entrypoint_c_api};
-use orc_rust::{ArrowReader, ArrowReaderBuilder};
+use orc_rust::{
+    projection::ProjectionMask,
+    ArrowReader, ArrowReaderBuilder,
+};
 use std::{
     error::Error,
     fs::File,
@@ -49,6 +52,12 @@ struct OrcInitData {
     /// fallback). Lives here — NOT in a `static` — so a query that ends early
     /// (e.g. LIMIT) doesn't poison the reader position for the next query.
     seq_reader: Mutex<Option<(usize, ArrowReader<File>)>>,
+    /// Projected file-column indices in DuckDB output order (projection
+    /// pushdown). Empty when DuckDB needs no columns at all (e.g. `count(*)`)
+    /// — in that case only row counts are streamed, nothing is decoded.
+    cols: Vec<usize>,
+    /// count(*) fast path: rows left to emit for the file at `file_index`.
+    rows_left: AtomicUsize,
 }
 
 /// Bound parameters: file paths (expanded from glob), schema, and stripe ranges.
@@ -58,6 +67,8 @@ struct OrcBindData {
     schema: Arc<arrow::datatypes::Schema>,
     /// Per-file stripe byte ranges for parallel reads.
     file_stripe_ranges: Vec<Vec<Range<usize>>>,
+    /// Per-file total row counts (metadata only), for the count(*) fast path.
+    file_row_counts: Vec<usize>,
 }
 
 #[cfg_attr(not(feature = "extension"), allow(dead_code))]
@@ -91,6 +102,7 @@ impl VTab for OrcVTab {
 
         let mut schema: Option<Arc<arrow::datatypes::Schema>> = None;
         let mut file_stripe_ranges: Vec<Vec<Range<usize>>> = Vec::with_capacity(file_paths.len());
+        let mut file_row_counts: Vec<usize> = Vec::with_capacity(file_paths.len());
 
         for path in &file_paths {
             let f = File::open(path)
@@ -101,6 +113,14 @@ impl VTab for OrcVTab {
 
             let file_meta = builder.file_metadata();
             let current_schema = builder.schema();
+
+            file_row_counts.push(
+                file_meta
+                    .stripe_metadatas()
+                    .iter()
+                    .map(|s| s.number_of_rows() as usize)
+                    .sum::<usize>(),
+            );
 
             // Validate schema consistency across files
             match &schema {
@@ -140,17 +160,30 @@ impl VTab for OrcVTab {
             bind.add_result_column(field.name(), duckdb_type);
         }
 
-        Ok(OrcBindData { file_paths, schema, file_stripe_ranges })
+        Ok(OrcBindData { file_paths, schema, file_stripe_ranges, file_row_counts })
     }
 
-    fn init(_: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
+    fn init(init: &InitInfo) -> std::result::Result<Self::InitData, Box<dyn Error>> {
+        // Projection pushdown: DuckDB tells us which file columns this query
+        // needs (in output order). Empty means no columns at all (count(*) etc.)
+        let cols: Vec<usize> = init
+            .get_column_indices()
+            .into_iter()
+            .map(|i| i as usize)
+            .collect();
         Ok(OrcInitData {
             done: AtomicBool::new(false),
             file_index: AtomicUsize::new(0),
             rx: Mutex::new(None),
             _handles: Mutex::new(Vec::new()),
             seq_reader: Mutex::new(None),
+            cols,
+            rows_left: AtomicUsize::new(0),
         })
+    }
+
+    fn supports_pushdown() -> bool {
+        true
     }
 
     fn func(
@@ -163,6 +196,12 @@ impl VTab for OrcVTab {
         if init_data.done.load(Ordering::Relaxed) {
             output.set_len(0);
             return Ok(());
+        }
+
+        // No columns requested (count(*), exists, ...): stream row counts from
+        // metadata — no decode, no I/O beyond the footer already read at bind.
+        if init_data.cols.is_empty() {
+            return func_count_only(init_data, bind_data, output);
         }
 
         // Try to pull a batch from the current parallel scan channel.
@@ -192,7 +231,7 @@ impl VTab for OrcVTab {
             }
 
             // Multiple stripes — launch parallel scan.
-            launch_parallel_scan(init_data, path, stripe_ranges, BATCH_SIZE)?;
+            launch_parallel_scan(init_data, bind_data, path, stripe_ranges, BATCH_SIZE)?;
             return poll_channel(init_data, bind_data, output);
         }
     }
@@ -207,7 +246,7 @@ impl VTab for OrcVTab {
 /// Poll the active channel for a RecordBatch. If exhausted, advance to next file.
 fn poll_channel(
     init_data: &OrcInitData,
-    _bind_data: &OrcBindData,
+    bind_data: &OrcBindData,
     output: &mut DataChunkHandle,
 ) -> Result<(), Box<dyn Error>> {
     let rx_guard = init_data.rx.lock().unwrap();
@@ -215,6 +254,7 @@ fn poll_channel(
     match rx.recv() {
         Ok(batch) => {
             drop(rx_guard);
+            let batch = reorder_batch(batch, &init_data.cols, &bind_data.schema)?;
             record_batch_to_duckdb_data_chunk(&batch, output)?;
             Ok(())
         }
@@ -254,10 +294,24 @@ fn read_sequential(
         let path = &bind_data.file_paths[current_idx];
         let file = File::open(path)
             .map_err(|e| format!("read_orc: cannot open '{path}': {e}"))?;
-        let reader = ArrowReaderBuilder::try_new(file)
-            .map_err(|e| format!("read_orc: failed to create reader for '{path}': {e}"))?
-            .with_batch_size(BATCH_SIZE)
-            .build();
+        let mut builder = ArrowReaderBuilder::try_new(file)
+            .map_err(|e| format!("read_orc: failed to create reader for '{path}': {e}"))?;
+        // Decode only the projected columns (projection pushdown). Match by
+        // top-level column NAME — ProjectionMask indices are ORC type ids
+        // (DFS, 1-based), not schema positions.
+        if init_data.cols.len() < bind_data.schema.fields().len() {
+            let names: Vec<String> = init_data
+                .cols
+                .iter()
+                .map(|&c| bind_data.schema.field(c).name().to_string())
+                .collect();
+            let mask = ProjectionMask::named_roots(
+                builder.file_metadata().root_data_type(),
+                &names,
+            );
+            builder = builder.with_projection(mask);
+        }
+        let reader = builder.with_batch_size(BATCH_SIZE).build();
         *guard = Some((current_idx, reader));
     }
 
@@ -265,6 +319,7 @@ fn read_sequential(
 
     match reader.next() {
         Some(Ok(batch)) => {
+            let batch = reorder_batch(batch, &init_data.cols, &bind_data.schema)?;
             record_batch_to_duckdb_data_chunk(&batch, output)?;
             Ok(())
         }
@@ -291,6 +346,7 @@ fn read_sequential(
 /// Launch worker threads to read individual stripes in parallel.
 fn launch_parallel_scan(
     init_data: &OrcInitData,
+    bind_data: &OrcBindData,
     path: &str,
     stripe_ranges: &[Range<usize>],
     batch_size: usize,
@@ -302,6 +358,19 @@ fn launch_parallel_scan(
     let (tx, rx) = mpsc::sync_channel::<arrow::array::RecordBatch>(num_workers * 4);
 
     let path = path.to_string();
+    let total_cols = bind_data.schema.fields().len();
+    // Projected top-level column NAMES for the ORC projection mask (matched by
+    // name because ProjectionMask indices are ORC type ids, not positions).
+    // Empty = decode everything.
+    let proj_names: Vec<String> = if init_data.cols.len() < total_cols {
+        init_data
+            .cols
+            .iter()
+            .map(|&c| bind_data.schema.field(c).name().to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut handles = Vec::with_capacity(num_workers);
 
     for worker_id in 0..num_workers {
@@ -314,6 +383,7 @@ fn launch_parallel_scan(
         let tx = tx.clone();
         let path = path.clone();
         let ranges: Vec<Range<usize>> = stripe_ranges[start..end].to_vec();
+        let proj_names = proj_names.clone();
 
         let handle = thread::Builder::new()
             .name(format!("orc-w{}", worker_id))
@@ -326,6 +396,16 @@ fn launch_parallel_scan(
                     let builder = match ArrowReaderBuilder::try_new(file) {
                         Ok(b) => b,
                         Err(_) => return,
+                    };
+                    // Decode only the projected columns (projection pushdown).
+                    let builder = if proj_names.is_empty() {
+                        builder
+                    } else {
+                        let mask = ProjectionMask::named_roots(
+                            builder.file_metadata().root_data_type(),
+                            &proj_names,
+                        );
+                        builder.with_projection(mask)
                     };
                     let mut reader = builder
                         .with_file_byte_range(range.clone())
@@ -353,6 +433,87 @@ fn launch_parallel_scan(
     *init_data.rx.lock().unwrap() = Some(rx);
 
     Ok(())
+}
+
+// ── Projection helpers ─────────────────────────────────────────────────────
+
+/// Emit row counts only (from stripe metadata) for queries that request no
+/// columns — `count(*)`, `exists`, ... No stripe data is read or decoded.
+fn func_count_only(
+    init_data: &OrcInitData,
+    bind_data: &OrcBindData,
+    output: &mut DataChunkHandle,
+) -> Result<(), Box<dyn Error>> {
+    loop {
+        let idx = init_data.file_index.load(Ordering::Relaxed);
+        if idx >= bind_data.file_paths.len() {
+            init_data.done.store(true, Ordering::Relaxed);
+            output.set_len(0);
+            return Ok(());
+        }
+        let mut left = init_data.rows_left.load(Ordering::Relaxed);
+        if left == 0 {
+            let total = bind_data.file_row_counts[idx];
+            if total == 0 {
+                init_data.file_index.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            init_data.rows_left.store(total, Ordering::Relaxed);
+            left = total;
+        }
+        let n = left.min(BATCH_SIZE);
+        let remaining = left - n;
+        init_data.rows_left.store(remaining, Ordering::Relaxed);
+        if remaining == 0 {
+            // Current file exhausted — next call starts the next file.
+            init_data.file_index.fetch_add(1, Ordering::Relaxed);
+        }
+        output.set_len(n);
+        return Ok(());
+    }
+}
+
+/// Align a decoded (projected) batch with DuckDB's expected column order.
+///
+/// orc-rust emits projected columns in its own (mask) order; DuckDB's
+/// projection pushdown expects chunk position *i* to hold file column
+/// `cols[i]`. Columns are matched by name against the full bind schema, so
+/// the mapping is correct regardless of decode order. Returns the batch
+/// unchanged when it is already in the right order.
+fn reorder_batch(
+    batch: arrow::array::RecordBatch,
+    cols: &[usize],
+    full_schema: &arrow::datatypes::Schema,
+) -> Result<arrow::array::RecordBatch, Box<dyn Error>> {
+    // Full scan, file order — nothing to do.
+    let n = full_schema.fields().len();
+    if cols.len() == n && cols.iter().enumerate().all(|(i, &c)| c == i) {
+        return Ok(batch);
+    }
+
+    let batch_schema = batch.schema();
+    let batch_fields = batch_schema.fields();
+    let full_names: Vec<&str> = full_schema.fields().iter().map(|f| f.name().as_str()).collect();
+    let mut arrays = Vec::with_capacity(cols.len());
+    let mut fields = Vec::with_capacity(cols.len());
+    let mut identity = true;
+    for (emit_pos, &file_col) in cols.iter().enumerate() {
+        let want = full_names[file_col];
+        let j = batch_fields
+            .iter()
+            .position(|f| f.name() == want)
+            .ok_or_else(|| format!("read_orc: projected column '{want}' missing from decoded batch"))?;
+        if j != emit_pos {
+            identity = false;
+        }
+        arrays.push(batch.column(j).clone());
+        fields.push(batch_fields[j].clone());
+    }
+    if identity {
+        return Ok(batch);
+    }
+    arrow::array::RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), arrays)
+        .map_err(|e| format!("read_orc: failed to reorder projected batch: {e}").into())
 }
 
 // ── Replacement scan ───────────────────────────────────────────────────────

@@ -38,6 +38,54 @@ fn test_read_orc_local() -> Result<()> {
 }
 
 #[test]
+fn test_projection_pushdown() -> Result<()> {
+    let db = open_test_db()?;
+    db.execute_batch("LOAD 'build/debug/extension/orc/orc.duckdb_extension';")?;
+
+    // Projection pushdown: single-column aggregates must decode only that
+    // column and return exactly the values of the full scan (asserted above
+    // for the same fixture: count=10000, avg=7499.25, min=0, max=14998.5).
+    let sum: f64 = db.query_row(
+        "SELECT sum(score) FROM read_orc('test/sql/test.orc')",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(sum, 74992500.0, "projected sum must match full scan");
+    println!("✅ Projection pushdown single-column: sum={sum}");
+
+    // No columns requested (count(*)): row-count fast path from metadata.
+    let n: i64 = db.query_row(
+        "SELECT count(*) FROM read_orc('test/sql/test.orc')",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(n, 10000, "count(*) fast path must return all rows");
+    println!("✅ Projection pushdown count(*): {n}");
+
+    // Column-subset query (two references to one projected column) stays
+    // correct after pruning + reordering.
+    let (mn, mx): (f64, f64) = db.query_row(
+        "SELECT min(score), max(score) FROM read_orc('test/sql/test.orc')",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(mn, 0.0);
+    assert_eq!(mx, 14998.5);
+    println!("✅ Projection pushdown subset: min={mn}, max={mx}");
+
+    // Nested in a larger plan with filters/limits (exercises early-exit of
+    // the parallel stripe scan without leaking worker threads).
+    let top: i64 = db.query_row(
+        "SELECT count(*) FROM (SELECT score FROM read_orc('test/sql/test.orc') WHERE score > 10000 LIMIT 5) t",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(top > 0 && top <= 5);
+    println!("✅ Projection pushdown + LIMIT early-exit: {top} rows");
+    Ok(())
+}
+
+#[test]
 fn test_write_orc_roundtrip() -> Result<()> {
     let db = open_test_db()?;
     db.execute_batch("LOAD 'build/debug/extension/orc/orc.duckdb_extension';")?;
