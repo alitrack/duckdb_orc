@@ -66,6 +66,43 @@ jobs:
           test -n "$(find release-assets -type f | head -1)"
           find release-assets -type f | sort
 
+      - name: Checkout (metadata tooling)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Ensure DuckDB extension metadata trailer
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import glob, os, subprocess, sys
+
+          VERSION = os.environ.get("GITHUB_REF_NAME", "0.0.0").lstrip("v")
+          fixed = 0
+          for path in sorted(glob.glob("release-assets/*.duckdb_extension")):
+              with open(path, "rb") as fh:
+                  tail = fh.read()[-600:]
+              if b"duckdb_signature" in tail:
+                  print(f"OK   (metadata present) {path}")
+                  continue
+              name = os.path.basename(path)  # orc-<platform>.duckdb_extension
+              platform = name[len("orc-"):-len(".duckdb_extension")]
+              if not platform:
+                  print(f"SKIP (unexpected name) {path}")
+                  continue
+              print(f"FIX  appending metadata -> {path} (platform={platform}, version={VERSION})")
+              subprocess.run(
+                  [sys.executable, "extension-ci-tools/scripts/append_extension_metadata.py",
+                   "-l", path, "-o", path, "-n", "orc",
+                   "-dv", "v1.2.0", "-ev", VERSION, "-p", platform],
+                  check=True,
+              )
+              fixed += 1
+          print(f"metadata fixup complete: {fixed} asset(s) repaired")
+          PYEOF
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
