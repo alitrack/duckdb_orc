@@ -8,6 +8,7 @@ Built on top of [`orc-rust`](https://github.com/datafusion-contrib/orc-rust), a 
 
 ### Read
 - `read_orc(file_path)` — read `.orc` files directly into DuckDB
+- **`FROM 'file.orc'` syntax** — replacement scan: any `.orc`-suffixed path (or glob) in a `FROM` clause resolves automatically, e.g. `SELECT * FROM 'data/sales.orc'` or `FROM 'data/*.orc'`
 - All ORC data types: primitives, struct, list, map
 - All ORC encodings and compression codecs (Zlib, Snappy, LZO, LZ4, ZSTD)
 - **Projection pushdown** — column pruning via DuckDB's optimizer

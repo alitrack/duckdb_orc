@@ -1,0 +1,35 @@
+# Replacement scan: FROM 'file.orc' / SELECT * FROM '*.orc' resolves to read_orc
+
+statement ok
+LOAD 'build/debug/extension/orc/orc.duckdb_extension';
+
+# Absolute path
+query I
+SELECT count(*) FROM '__TEST_DIR__/test.orc';
+
+10000
+
+# Relative path with ./ prefix
+query I
+SELECT count(*) FROM './__TEST_DIR__/test.orc';
+
+10000
+
+# Data correctness through FROM syntax
+query IT
+SELECT id, name FROM '__TEST_DIR__/test.orc' LIMIT 2;
+
+0 user_0
+1 user_1
+
+# Non-ORC table names are NOT intercepted
+statement ok
+CREATE TABLE regular_tbl AS SELECT 1 AS a;
+
+query I
+SELECT * FROM regular_tbl;
+
+1
+
+statement ok
+DROP TABLE regular_tbl;

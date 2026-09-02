@@ -45,6 +45,10 @@ struct OrcInitData {
     rx: Mutex<Option<Receiver<arrow::array::RecordBatch>>>,
     /// Worker thread handles, joined on completion.
     _handles: Mutex<Vec<JoinHandle<()>>>,
+    /// Sequential reader for the file currently being read (single-stripe
+    /// fallback). Lives here — NOT in a `static` — so a query that ends early
+    /// (e.g. LIMIT) doesn't poison the reader position for the next query.
+    seq_reader: Mutex<Option<(usize, ArrowReader<File>)>>,
 }
 
 /// Bound parameters: file paths (expanded from glob), schema, and stripe ranges.
@@ -145,6 +149,7 @@ impl VTab for OrcVTab {
             file_index: AtomicUsize::new(0),
             rx: Mutex::new(None),
             _handles: Mutex::new(Vec::new()),
+            seq_reader: Mutex::new(None),
         })
     }
 
@@ -237,10 +242,7 @@ fn read_sequential(
     bind_data: &OrcBindData,
     output: &mut DataChunkHandle,
 ) -> Result<(), Box<dyn Error>> {
-    // Static guard so we don't open/close the same file repeatedly.
-    static SEQ: Mutex<Option<(usize, ArrowReader<File>)>> = Mutex::new(None);
-
-    let mut guard = SEQ.lock().unwrap();
+    let mut guard = init_data.seq_reader.lock().unwrap();
     let current_idx = init_data.file_index.load(Ordering::Relaxed);
 
     let needs_new = match guard.as_ref() {
@@ -353,6 +355,53 @@ fn launch_parallel_scan(
     Ok(())
 }
 
+// ── Replacement scan ───────────────────────────────────────────────────────
+//
+// Lets users write `FROM 'file.orc'` / `FROM '*.orc'` (or `SELECT * FROM
+// 'path.orc'`) without naming the read_orc function explicitly. DuckDB calls
+// registered replacement scans when a base table reference looks like a file
+// path; we rewrite `.orc`-suffixed names into read_orc(name).
+
+#[cfg(feature = "extension")]
+fn register_orc_replacement_scan(db: ffi::duckdb_database) {
+    unsafe extern "C" fn orc_replacement_scan(
+        info: ffi::duckdb_replacement_scan_info,
+        table_name: *const std::os::raw::c_char,
+        _extra_data: *mut std::ffi::c_void,
+    ) {
+        if info.is_null() || table_name.is_null() {
+            return;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(table_name) };
+        let name_str = name.to_string_lossy();
+
+        // Only claim paths that look like ORC files. Case-insensitive on the
+        // extension; glob patterns (`*.orc`, `data/*.orc`) end with .orc too,
+        // and read_orc handles the glob. Anything else passes through to other
+        // replacement scans / the normal catalog lookup.
+        let lower = name_str.to_lowercase();
+        if !lower.ends_with(".orc") {
+            return;
+        }
+
+        // Replace with read_orc('<name>')
+        unsafe {
+            ffi::duckdb_replacement_scan_set_function_name(info, c"read_orc".as_ptr());
+            let value = ffi::duckdb_create_varchar(table_name);
+            if !value.is_null() {
+                ffi::duckdb_replacement_scan_add_parameter(info, value);
+                // The C API copies the value into the scan; we still own ours.
+                let mut v = value;
+                ffi::duckdb_destroy_value(&mut v);
+            }
+        }
+    }
+
+    unsafe {
+        ffi::duckdb_add_replacement_scan(db, Some(orc_replacement_scan), std::ptr::null_mut(), None);
+    }
+}
+
 // ── Entrypoint ─────────────────────────────────────────────────────────────
 //
 // The `duckdb_entrypoint_c_api` macro doesn't expose the raw `duckdb_connection`
@@ -408,6 +457,11 @@ unsafe fn orc_init_internal(
             return Ok(false);
         }
         let db: ffi::duckdb_database = *db_ptr;
+
+        // Register the replacement scan so `FROM 'file.orc'` / `SELECT * FROM
+        // '*.orc'` resolves to read_orc(...) — same mechanism DuckDB uses for
+        // parquet/csv/json.
+        register_orc_replacement_scan(db);
 
         // Register the read table function via the high-level crate.
         let connection = Connection::open_from_raw(db.cast())?;
