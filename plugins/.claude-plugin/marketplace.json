@@ -1,0 +1,15 @@
+{
+  "name": "duckdb-orc",
+  "owner": {
+    "name": "alitrack",
+    "url": "https://github.com/alitrack"
+  },
+  "plugins": [
+    {
+      "name": "duckdb-orc",
+      "description": "Verified SQL knowledge for the orc DuckDB extension: reading and writing Apache ORC files with read_orc, replacement scans, globs, and COPY TO — pure Rust",
+      "source": "./duckdb-orc",
+      "category": "data"
+    }
+  ]
+}

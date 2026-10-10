@@ -1,0 +1,9 @@
+{
+  "name": "duckdb-orc",
+  "version": "0.2.1",
+  "description": "Verified knowledge for the orc DuckDB extension: read_orc, FROM 'file.orc' replacement scans, glob reads, COPY TO orc, and current limitations (no filter pushdown, writer type constraints).",
+  "author": {
+    "name": "alitrack"
+  },
+  "homepage": "https://github.com/alitrack/duckdb_orc"
+}
